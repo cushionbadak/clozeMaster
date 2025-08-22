@@ -120,7 +120,7 @@ if __name__=="__main__":
     
     
     logging.info('============================\n rs_files num:{}\n=========================\n'.format(len(rs_files)))
-    bug_count=0
+    newfiles = []
     for rs_file in tqdm(rs_files):
         with open(rs_file,'r',errors='ignore') as f:
             code = f.read()
@@ -139,21 +139,26 @@ if __name__=="__main__":
             new_code=incoder.code_infilling(masked_code,temperature=0.2)
             with open(masked_file,'w') as f:
                 f.write(new_code)
+                newfiles.append((masked_file, newfilename))
 
-            if args.multi_opt:
-                for opt in opts:
-                    status,err=compile_rust(os.path.dirname(masked_file),newfilename,opt)
-                    err_info,stack_info=get_err(err)
-                    if status!="ok":
-                        bug_count+=1
-                        add_csv(csv_file,["filename","opt","status","err_info","stack_info"],[masked_file,opt,status,err_info,stack_info])
-                    logging.info('filename:{} opt:{} status:{} err_info:{} stack_info:{}'.format(newfilename,opt,status,err_info,stack_info))
-            else:
-                opt="0"
+    logging.info('============================\n newfiles num:{}\n=========================\n'.format(len(newfiles)))
+
+    bug_count=0
+    for masked_file, newfilename in tqdm(newfiles):
+        if args.multi_opt:
+            for opt in opts:
                 status,err=compile_rust(os.path.dirname(masked_file),newfilename,opt)
                 err_info,stack_info=get_err(err)
                 if status!="ok":
+                    bug_count+=1
                     add_csv(csv_file,["filename","opt","status","err_info","stack_info"],[masked_file,opt,status,err_info,stack_info])
                 logging.info('filename:{} opt:{} status:{} err_info:{} stack_info:{}'.format(newfilename,opt,status,err_info,stack_info))
+        else:
+            opt="0"
+            status,err=compile_rust(os.path.dirname(masked_file),newfilename,opt)
+            err_info,stack_info=get_err(err)
+            if status!="ok":
+                add_csv(csv_file,["filename","opt","status","err_info","stack_info"],[masked_file,opt,status,err_info,stack_info])
+            logging.info('filename:{} opt:{} status:{} err_info:{} stack_info:{}'.format(newfilename,opt,status,err_info,stack_info))
 
                 
