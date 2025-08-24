@@ -10,7 +10,7 @@ from typing import List
 
 import torch
 import tokenizers
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 import transformers
 
 # incoder model reference: https://github.com/dpfried/incoder
@@ -49,27 +49,52 @@ except Exception:
     pass
 
 
-def load_model(model_path, tokenizer_path,device ):
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+import logging
+
+def load_model(model_path, tokenizer_path, device):
     kwargs = {}
     logging.info(f"loading model from {model_path} ...")
-    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
-    
-    model = model.half().to(device)
-    logging.info(f"loading tokenizer from {tokenizer_path} ...")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs).half().to(device)
 
-    # --- FIX: upstream 방식과 동일하게 PAD는 고유 토큰("<pad>") 사용 ---
-    if tokenizer.pad_token is None:
-        added = tokenizer.add_special_tokens({"pad_token": "<pad>"})
-        if added > 0:
-            model.resize_token_embeddings(len(tokenizer))
-    tokenizer.padding_side = "left"  # 왼쪽 패딩 고정(디코딩 로직과 일치)
-    # 모델/generation 설정 동기화(경고 제거)
-    model.config.pad_token_id = tokenizer.pad_token_id
+    logging.info(f"loading tokenizer from {tokenizer_path} ...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        bos_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+        pad_token="<pad>",
+    )
+    tokenizer.padding_side = "left"
+
+    # --- 체크: bos_token 값 확인 ---
+    if tokenizer.bos_token != "<|endoftext|>":
+        raise ValueError(
+            f"Unexpected bos_token: {tokenizer.bos_token!r}. "
+            f"InCoder requires '<|endoftext|>' as bos_token."
+        )
+    logging.info(f"bos_token check passed: {tokenizer.bos_token!r}")
+
+    # 토큰 사전 크기 동기화
+    model.resize_token_embeddings(len(tokenizer))
+
+    # 모델 config 동기화
+    ids = dict(
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    for k, v in ids.items():
+        setattr(model.config, k, v)
+
+    # generation_config 재생성
     try:
-        model.generation_config.pad_token_id = tokenizer.pad_token_id
+        model.generation_config = GenerationConfig.from_model_config(model.config)
     except Exception:
-        pass
+        model.generation_config = GenerationConfig(
+            bos_token_id=ids["bos_token_id"],
+            eos_token_id=ids["eos_token_id"],
+            pad_token_id=ids["pad_token_id"],
+        )
 
     return model, tokenizer
 
@@ -80,11 +105,18 @@ class InCoder:
         self.device = device
         self.BOS = "<|endoftext|>"
         self.EOM = "<|endofmask|>"
-        # 방어적: 혹시라도 외부에서 tokenizer가 먼저 사용될 때를 대비
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
-            self.model.resize_token_embeddings(len(self.tokenizer))
-        self.model.config.pad_token_id = self.tokenizer.pad_token_id
+
+    def _eom_token_id(self):
+        """
+        EOM(\"<|endofmask|>\")가 단일 토큰이면 해당 ID(int)를 돌려주고,
+        다중 토큰이면 None을 돌려준다.
+        배치 안전 조기종료는 단일 토큰일 때만 HF의 eos_token_id로 처리한다.
+        """
+        try:
+            ids = self.tokenizer.encode(self.EOM, add_special_tokens=False)
+            return ids[0] if len(ids) == 1 else None
+        except Exception:
+            return None
 
 
     def make_sentinel(self,i):
@@ -119,27 +151,11 @@ class InCoder:
 
     def generate(self, input, max_to_generate=128, temperature=0.2):
         from transformers import StoppingCriteria, StoppingCriteriaList
-
-        class _StopOnSubsequence(StoppingCriteria):
-            # Python 3.8 호환: typing.List 사용
-            def __init__(self, stop_sequences: List[List[int]], device):
-                super().__init__()
-                # 비교 비용을 줄이기 위해 미리 (GPU) 텐서로 변환해 둠
-                self.stop_sequences = [torch.tensor(s, device=device, dtype=torch.long) for s in stop_sequences]
-
-            def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-                # batch=1 가정. 마지막 L개 토큰이 stop 시퀀스와 정확히 일치하면 True
-                seq = input_ids[0]
-                for stop_ids in self.stop_sequences:
-                    L = stop_ids.numel()
-                    if L == 0 or seq.numel() < L:
-                        continue
-                    if torch.equal(seq[-L:], stop_ids):
-                        return True
-                return False
+        eom_id = self._eom_token_id()
 
         # (1) 입력 토크나이즈 → 디바이스 (token_type_ids 미생성)
-        enc = self.tokenizer(input, return_tensors="pt", return_token_type_ids=False)
+
+        enc = self.tokenizer(input, return_tensors="pt", return_token_type_ids=False, add_special_tokens=False)
         input_ids = enc.input_ids.to(self.device)
         attention_mask = enc.attention_mask.to(self.device) if hasattr(enc, "attention_mask") else None
 
@@ -149,9 +165,26 @@ class InCoder:
         if max_length > 2048:
             logging.warning("warning: max_length {} is greater than the context window {}".format(max_length, 2048))
 
-        # (3) EOM 토큰 시퀀스를 스톱 조건으로 등록(다중 토큰 고려)
-        eom_ids = self.tokenizer.encode(self.EOM, add_special_tokens=False)
-        stopping_criteria = StoppingCriteriaList([_StopOnSubsequence([eom_ids], device=self.device)])
+        # (3) 조기 종료 설정
+        #  - 단일 토큰이면 eos_token_id 사용(배치에서도 안전한 방식과 일치)
+        #  - 다중 토큰이면 (batch=1 가정 경로에서는) 커스텀 스토퍼 사용
+        stopping_criteria = None
+        if eom_id is None:
+            class _StopOnSubsequence(StoppingCriteria):
+                def __init__(self, stop_sequences: List[List[int]], device):
+                    super().__init__()
+                    self.stop_sequences = [torch.tensor(s, device=device, dtype=torch.long) for s in stop_sequences]
+                def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+                    seq = input_ids[0]  # batch=1
+                    for stop_ids in self.stop_sequences:
+                        L = stop_ids.numel()
+                        if L == 0 or seq.numel() < L:
+                            continue
+                        if torch.equal(seq[-L:], stop_ids):
+                            return True
+                    return False
+            eom_ids = self.tokenizer.encode(self.EOM, add_special_tokens=False)
+            stopping_criteria = StoppingCriteriaList([_StopOnSubsequence([eom_ids], device=self.device)])
 
         # (4) 생성: EOM이 나오면 즉시 중단, 그렇지 않으면 max_length까지 진행
         with torch.no_grad():
@@ -164,12 +197,16 @@ class InCoder:
                  top_p=0.95,
                  temperature=temperature,
                  max_length=max_length,               # 안전망 유지
-                 stopping_criteria=stopping_criteria, # 조기 종료의 핵심
+                 pad_token_id=self.tokenizer.pad_token_id,
             )
+            if stopping_criteria is not None:
+                gen_kwargs["stopping_criteria"] = stopping_criteria
+            elif eom_id is not None:
+                gen_kwargs["eos_token_id"] = eom_id
             if attention_mask is not None:
                 gen_kwargs["attention_mask"] = attention_mask
             output = self.model.generate(**gen_kwargs)
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
 
             # # performance(time) observation (end point)
             # output_time = time.perf_counter() - start_time
@@ -273,26 +310,32 @@ class InCoder:
         """
         여러 프롬프트를 한 번에 생성한다. 반환은 각 샘플의 '전체 디코드 문자열'(BOS 제거)이다.
         - generate()와 정책 동일: top_p=0.95, temperature, max_length=입력길이+max_to_generate
-        - 조기 종료: EOM("<|endofmask|>") 접미사 등장 시 중단
+        - 조기 종료(안전): EOM 단일 토큰이면 eos_token_id 활용
         - 재현성: Hugging Face가 리스트 형태의 per-sample generator를 지원하는 버전이면 `generators`에 전달.
         """
         assert isinstance(prompts, list)
         if len(prompts) == 0:
             return []
 
+        # EOM 단일 토큰 여부 확인
+        eom_id = self._eom_token_id()
+        if eom_id is None:
+            # 배치 조기종료는 다중 토큰에서 안전하지 않다. 정확성을 우선하여 단일 샘플 경로로 폴백.
+            logging.warning("EOM is multi-token for this tokenizer; falling back to per-sample generation for correctness.")
+            return [self.generate(p, max_to_generate=max_to_generate, temperature=temperature) for p in prompts]
+
         enc = self.tokenizer(
             prompts,
             return_tensors="pt",
             padding=True,
-            return_token_type_ids=False,  # ← 생성 자체를 막음
+            return_token_type_ids=False,
+            add_special_tokens=False,     # ← eos/pad 의존 제거
         )
         # 혹시 토크나이저 구현에 따라 들어오면 방어적으로 제거
         inputs = {k: v.to(self.device) for k, v in enc.items() if k != "token_type_ids"}
         max_length = inputs["input_ids"].shape[1] + max_to_generate
         if max_length > 2048:
             logging.warning("warning: max_length %d exceeds context window 2048", max_length)
-
-        stopping_criteria = self._make_eom_stopper()
 
         gen_arg = generators if generators is not None else None
         # 호환성: 일부 버전은 per-sample generator 리스트를 지원하지 않음
@@ -306,10 +349,11 @@ class InCoder:
                 top_p=0.95,
                 temperature=temperature,
                 max_length=max_length,
-                stopping_criteria=stopping_criteria,
+                eos_token_id=eom_id,                  # ← 배치-안전한 조기 종료
+                pad_token_id=self.tokenizer.pad_token_id,
                 generator=gen_arg,
             )
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         decoded = []
         pad_id = self.tokenizer.pad_token_id

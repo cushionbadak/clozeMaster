@@ -97,7 +97,7 @@ if __name__=="__main__":
     parser.add_argument('--batch_size', type=int, default=4,
                         help="최대 batch size (기본: 4). masked_codes가 많으면 잘라서 여러 배치로 처리.")
     parser.add_argument(
-        '--no-batch', action='store_true',
+        '--no_batch', action='store_true',
         help="배치 사용 없이 단일 호출(code_infilling) 경로로 실행."
     )
 
