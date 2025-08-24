@@ -6,116 +6,102 @@ import logging
 import argparse
 from tqdm import tqdm
 import subprocess
-import time
 import csv
+import atexit
+import gc
+import signal
 
-# [PATCH] 프로세스당 CPU 스레드 폭주 방지 (가능한 한 일찍 설정)
+# 안정성: 한 프로세스당 CPU 스레드 과도 사용 억제
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
-
-# [PATCH] 종료/정리 유틸
-import atexit
-import gc
-import signal
-
 from model.IncoderModel import InCoder
 from utils.masking import ClozeMask
 
 
-def get_rs_files(directory, suffix=['rs']):
-    rs_files = []
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.split('.')[-1] in suffix:
-                rs_files.append(os.path.join(root, file))
-    return rs_files
+# ============== 유틸 ==============
 
+def get_rs_files(directory, suffix=('rs',)):
+    files = []
+    for root, _, fs in os.walk(directory):
+        for f in fs:
+            if f.split('.')[-1] in suffix:
+                files.append(os.path.join(root, f))
+    return files
 
-def compare_text(text1, text2):
-    text1 = text1.replace(' ', '').replace('\n', '').replace('\t', '')
-    text2 = text2.replace(' ', '').replace('\n', '').replace('\t', '')
-    return text1 == text2
+def add_csv(filename, columns, new_line):
+    need_header = (not os.path.exists(filename)) or (os.path.getsize(filename) == 0)
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with open(filename, 'a', newline='') as fp:
+        wr = csv.writer(fp)
+        if need_header:
+            wr.writerow(columns)
+        wr.writerow(new_line)
 
+def ensure_parent(path):
+    parent = os.path.dirname(path)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent)
 
-def compile_rust(filepath, rsfile, opt):
+def compile_rust(dirpath, rsfile, opt):
     cmd = f"rustc {rsfile} -C opt-level={opt} --out-dir temp"
-    time_limit = 60  # 재현을 빠르게 하려면 60, 안정성은 180
-    p = subprocess.Popen(cmd, cwd=filepath, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    p = subprocess.Popen(cmd, cwd=dirpath, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          shell=True, text=True)
     try:
-        out, err = p.communicate(timeout=time_limit)
-        returncode = p.returncode
-        low = err.lower()
-        if "internal compiler error" in low or "compiler unexpectedly panicked" in low:
-            return "ice", err
-        elif returncode == 137:
-            return "mem err", err
-        elif "process didn't exit successfully" in low:
-            return "crash", err
-        else:
-            return "ok", err
+        out, err = p.communicate(timeout=60)
     except subprocess.TimeoutExpired:
         p.terminate()
         return "timeout", ""
 
+    rc = p.returncode
+    low = err.lower()
+    if "internal compiler error" in low or "compiler unexpectedly panicked" in low:
+        return "ice", err
+    if rc == 137:
+        return "mem err", err
+    if "process didn't exit successfully" in low:
+        return "crash", err
+    return "ok", err
 
-def get_err(err):
-    err_info = re.findall(r"thread 'rustc' panicked at.*?\n", err, re.DOTALL)
-    if len(err_info) == 0:
-        err_info = ""
-    else:
-        err_info = err_info[0]
+def parse_err(err):
+    # 요약용
+    m = re.findall(r"thread 'rustc' panicked at.*?\n", err, re.DOTALL)
+    err_info = m[0] if m else ""
+    s, e = err.find("query stack during panic:"), err.find("end of query stack")
+    stack = err[s:e]
+    lines = []
+    for line in stack.split("\n"):
+        if "]" in line:
+            lines.append(line[:line.find("]")+1])
+    return err_info, "\n".join(lines)
 
-    start = err.find("query stack during panic:")
-    end = err.find("end of query stack")
-    stack_info = err[start:end]
-    stack_info = stack_info.split("\n")
-    stack_info = [info[:info.find("]")+1] for info in stack_info if "]" in info]
-    stack_info = "\n".join(stack_info)
-    return err_info, stack_info
-
-
-def add_csv(filename, columns, new_line_list):
-    need_header = not os.path.exists(filename) or os.path.getsize(filename) == 0
-    with open(filename, 'a', newline='') as file:
-        writer = csv.writer(file)
-        if need_header:
-            writer.writerow(columns)
-        writer.writerow(new_line_list)
+def partition_indices(n_items, split, split_index_1based):
+    # i % split == split_index-1
+    keep = []
+    k = split_index_1based - 1
+    for i in range(n_items):
+        if (i % split) == k:
+            keep.append(i)
+    return keep
 
 
-def ensure_file_path_exists(file_path):
-    directory = os.path.dirname(file_path)
-    if directory and not os.path.exists(directory):
-        os.makedirs(directory)
+# ============== 전역(단일 프로세스 자원) ==============
+_INCODER = None
+_MASKER = None
 
-
-# ---------------------------
-# 프로세스 전역 (각 프로세스 1회 초기화)
-# ---------------------------
-_PROC_INCODER = None
-_PROC_CLOZE_MASK = None
-_PROC_READY = False
-
-# [PATCH] 워커 종료 시 VRAM/리소스 정리
-def _proc_finalize():
-    global _PROC_INCODER, _PROC_CLOZE_MASK
+def _finalize():
+    global _INCODER, _MASKER
     try:
-        if _PROC_INCODER is not None and hasattr(_PROC_INCODER, "model"):
+        if _INCODER is not None and hasattr(_INCODER, "model"):
             try:
-                _PROC_INCODER.model.to("cpu")
+                _INCODER.model.to("cpu")
             except Exception:
                 pass
-        _PROC_INCODER = None
-        _PROC_CLOZE_MASK = None
+        _INCODER = None
+        _MASKER = None
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -123,169 +109,191 @@ def _proc_finalize():
     except Exception:
         pass
 
-# [PATCH] SIGTERM/SIGINT 수신 시 정리 후 즉시 종료
-def _sigterm_then_exit(signum, frame):
-    _proc_finalize()
+def _sig_exit(signum, frame):
+    _finalize()
     os._exit(0)
 
-
-def _proc_initializer(model_path, tokenizer_path, device_str):
-    """
-    각 워커 프로세스에서 1회 실행되어 모델/토크나이저/마스커를 로드.
-    """
-    # [PATCH] 종료 훅/시그널 → 먼저 등록
-    atexit.register(_proc_finalize)
+def init_model(model_path, tokenizer_path, device_str):
+    atexit.register(_finalize)
     try:
-        signal.signal(signal.SIGTERM, _sigterm_then_exit)
-        signal.signal(signal.SIGINT, _sigterm_then_exit)
+        signal.signal(signal.SIGTERM, _sig_exit)
+        signal.signal(signal.SIGINT, _sig_exit)
     except Exception:
         pass
-
-    # [PATCH] 프로세스당 CPU 스레드 수 제한 (프리즈 방지)
     try:
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
     except Exception:
         pass
 
-    global _PROC_INCODER, _PROC_CLOZE_MASK, _PROC_READY
+    global _INCODER, _MASKER
     device = torch.device(device_str)
-    _PROC_INCODER = InCoder(model_path, tokenizer_path, device)
-    _PROC_CLOZE_MASK = ClozeMask()
-    _PROC_READY = True
+    _INCODER = InCoder(model_path, tokenizer_path, device)
+    _MASKER = ClozeMask()
 
-
-def _process_one_file(rs_file, temperature):
+def process_one_file(rs_path, temperature, out_root):
     """
-    단일 파일을 처리하여 (masked_file_path, file_name) 리스트를 반환.
-    배치 없이, 조기 종료가 활성화된 InCoder.generate 경로만 사용.
+    단일 .rs 파일을 변이 생성하여 out_root 하위에 저장.
+    반환: [(mutant_abs_path, mutant_filename), ...]
     """
-    if not _PROC_READY:
-        raise RuntimeError("Process not initialized")
-
-    incoder = _PROC_INCODER
-    cloze_mask = _PROC_CLOZE_MASK
-
-    newfiles_local = []
-
-    with open(rs_file, 'r', errors='ignore') as f:
+    with open(rs_path, 'r', errors='ignore') as f:
         code = f.read()
-
-    # 매우 긴 파일은 건너뜀(기존 동작 유지)
     if len(code) > 500:
-        return newfiles_local
+        return []
 
-    masked_codes = cloze_mask.mask_singel_code(code)
+    masked_list = _MASKER.mask_singel_code(code)
 
-    filename = os.path.basename(rs_file)
-    stem, ext = os.path.splitext(filename)
-    out_dir = os.path.dirname(rs_file).replace('dataset', 'target_dataset')
+    fname = os.path.basename(rs_path)
+    stem, ext = os.path.splitext(fname)
+
+    # 입력 디렉터리 구조를 보존하려면 relpath 기준을 잡는다.
+    # 여기선 rs_files 루트에서의 상대 경로를 유지하고 싶다면,
+    # 호출자가 out_root만 주고, 아래에 적절히 하위 폴더를 구성해도 된다.
+    out_dir = out_root  # 단순화: 한 루트에 평탄화 저장
     os.makedirs(out_dir, exist_ok=True)
 
-    for idx, masked in enumerate(masked_codes, start=1):
-        new_code = incoder.code_infilling(masked, temperature=temperature)
-        newfilename = f"{stem}_{idx}{ext}"
-        masked_file = os.path.join(out_dir, newfilename)
-        with open(masked_file, 'w') as wf:
+    results = []
+    for i, masked in enumerate(masked_list, 1):
+        new_code = _INCODER.code_infilling(masked, temperature=temperature)
+        out_name = f"{stem}_{i}{ext}"
+        out_path = os.path.join(out_dir, out_name)
+        with open(out_path, 'w') as wf:
             wf.write(new_code)
-        newfiles_local.append((masked_file, newfilename))
+        results.append((out_path, out_name))
+    return results
 
-    return newfiles_local
 
+# ============== 메인 ==============
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, default="/clozeMaster/model/Incoder1b")
-    parser.add_argument('--tokenizer_path', type=str, default="/clozeMaster/model/Incoder1b")
-    parser.add_argument('--rs_files', type=str, default='./dataset/history_codes')
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--model_path', type=str, default="/clozeMaster/model/Incoder1b")
+    ap.add_argument('--tokenizer_path', type=str, default="/clozeMaster/model/Incoder1b")
+    ap.add_argument('--rs_files', type=str, default='./dataset/history_codes')
 
-    parser.add_argument('--csv_file', type=str, default='./log/bug.csv')
-    parser.add_argument('--log_file', type=str, default='./log/demo.log')
-    parser.add_argument('--multi_opt', action='store_true', help='여러 opt-level로 컴파일')
+    ap.add_argument('--out_root', type=str, default='./target_dataset',
+                    help='생성된 변이 파일을 저장할 루트 디렉터리')
 
-    parser.add_argument('--temperature', type=float, default=0.2)
-    parser.add_argument('--workers', type=int, default=1)
+    # 로그/CSV (분할 시 기본값을 쓰면 자동 접미사 부여)
+    ap.add_argument('--csv_file', type=str, default='./log/bug.csv')
+    ap.add_argument('--log_file', type=str, default='./log/demo.log')
 
-    args = parser.parse_args()
+    ap.add_argument('--multi_opt', action='store_true')
+    ap.add_argument('--temperature', type=float, default=0.2)
 
-    ensure_file_path_exists(args.log_file)
-    ensure_file_path_exists(args.csv_file)
+    # 분할 실행(원시 병렬)
+    ap.add_argument('--split', type=int, default=1, help='총 분할 개수')
+    ap.add_argument('--split-index', type=int, default=1, help='이 실행이 담당할 1-base 분할 번호')
+    ap.add_argument('--emit-splits-dir', type=str, default=None,
+                    help='지정 시 split_1.txt … split_N.txt 파일을 생성(옵션)')
 
-    logging.basicConfig(level=logging.INFO,
-                        filename=args.log_file,
-                        filemode="w",
-                        format="%(asctime)s - %(name)s - %(levelname)-9s - %(filename)-8s : %(lineno)s line - %(message)s",
-                        datefmt="%Y-%m-%d %H:%M:%S")
-    # [PATCH] 콘솔 로그도 추가(걸리면 바로 보이게)
+    # 선택적 섞기(모든 프로세스 동일 seed면 분배 일관)
+    ap.add_argument('--shuffle', action='store_true')
+    ap.add_argument('--shuffle-seed', type=int, default=0)
+
+    args = ap.parse_args()
+
+    if args.split < 1:
+        raise SystemExit("--split must be >= 1")
+    if not (1 <= args.split_index <= max(1, args.split)):
+        raise SystemExit("--split-index must be in [1, --split]")
+
+    # 분할 태그
+    split_tag = f"s{args.split_index}-of-{args.split}" if args.split > 1 else "all"
+
+    # 기본 로그/CSV면 자동 접미사
+    def suffix_if_default(path, default_root, default_name):
+        default_path = os.path.join(default_root, default_name)
+        if os.path.normpath(path) == os.path.normpath(default_path) and args.split > 1:
+            r, ext = os.path.splitext(path)
+            return f"{r}.{split_tag}{ext}"
+        return path
+
+    args.log_file = suffix_if_default(args.log_file, "./log", "demo.log")
+    args.csv_file = suffix_if_default(args.csv_file, "./log", "bug.csv")
+    ensure_parent(args.log_file)
+    ensure_parent(args.csv_file)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        filename=args.log_file,
+        filemode="w",
+        format="%(asctime)s - %(levelname)-7s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
-    console.setFormatter(logging.Formatter("%(levelname)-8s - %(message)s"))
+    console.setFormatter(logging.Formatter("%(levelname)-7s - %(message)s"))
     logging.getLogger("").addHandler(console)
 
+    # 파일 수집
+    files = get_rs_files(args.rs_files)
+    files.sort()
+
+    if args.shuffle:
+        rnd = random.Random(args.shuffle_seed)
+        rnd.shuffle(files)
+        logging.info("Shuffle enabled (seed=%d)", args.shuffle_seed)
+
+    # 분할 파일 목록 미리 출력(옵션)
+    if args.emit_splits_dir:
+        os.makedirs(args.emit_splits_dir, exist_ok=True)
+        buckets = [[] for _ in range(args.split)]
+        for i, p in enumerate(files):
+            buckets[i % args.split].append(p)
+        for k in range(args.split):
+            with open(os.path.join(args.emit_splits_dir, f"split_{k+1}.txt"), "w") as f:
+                for p in buckets[k]:
+                    f.write(p + "\n")
+        logging.info("Wrote split lists to %s", args.emit_splits_dir)
+
+    # 이 프로세스가 담당할 분할 서브셋으로 축소
+    if args.split > 1:
+        keep = set(partition_indices(len(files), args.split, args.split_index))
+        files = [p for i, p in enumerate(files) if i in keep]
+
+    # 출력 루트: 분할 태그 하위 경로 사용
+    out_root = args.out_root if args.split == 1 else os.path.join(args.out_root, split_tag)
+    os.makedirs(out_root, exist_ok=True)
+
+    logging.info("Total files for this run: %d", len(files))
+    logging.info("Split: %s", split_tag)
+    logging.info("Out root: %s", out_root)
+
+    # 모델 초기화
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device_str = "cuda:0" if device.type == "cuda" and torch.cuda.device_count() > 0 else "cpu"
+    init_model(args.model_path, args.tokenizer_path, device_str)
 
-    rs_files = get_rs_files(args.rs_files)
-    random.shuffle(rs_files)
-
-    logging.info('============================\n rs_files num:{}\n=========================\n'.format(len(rs_files)))
-    logging.info("settings: temperature=%.3f, workers=%d", args.temperature, args.workers)
-
+    # 변이 생성
     newfiles = []
+    for fp in tqdm(files):
+        newfiles.extend(process_one_file(fp, temperature=args.temperature, out_root=out_root))
 
-    if args.workers <= 1:
-        _proc_initializer(args.model_path, args.tokenizer_path, device_str)
-        for rs_file in tqdm(rs_files):
-            res = _process_one_file(rs_file, temperature=args.temperature)
-            newfiles.extend(res)
-        _proc_finalize()
-    else:
-        # [PATCH] spawn 컨텍스트 고정
-        ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(
-            max_workers=args.workers,
-            mp_context=ctx,
-            initializer=_proc_initializer,
-            initargs=(args.model_path, args.tokenizer_path, device_str)
-        ) as ex:
-            futures = [ex.submit(_process_one_file, rs_file, args.temperature) for rs_file in rs_files]
-            for fut in tqdm(as_completed(futures), total=len(futures)):
-                exc = fut.exception()
-                if exc:
-                    logging.exception("Worker failed with %s: %s", type(exc).__name__, exc)
-                    print(f"Worker failed with {type(exc).__name__}: {exc}")
-                    continue
-                res = fut.result()
-                newfiles.extend(res)
-            # [PATCH] 명시적 종료
-            ex.shutdown(wait=True, cancel_futures=True)
+    _finalize()
 
-    logging.info('============================\n newfiles num:{}\n=========================\n'.format(len(newfiles)))
+    logging.info("Generated mutants: %d", len(newfiles))
 
+    # 컴파일 검증
     opts = ['0', '1', '2', '3', 's', 'z']
-    csv_file = args.csv_file
-
-    for masked_file, newfilename in tqdm(newfiles):
+    for mpath, mname in tqdm(newfiles):
+        d = os.path.dirname(mpath)
         if args.multi_opt:
             for opt in opts:
-                status, err = compile_rust(os.path.dirname(masked_file), newfilename, opt)
-                err_info, stack_info = get_err(err)
+                status, err = compile_rust(d, mname, opt)
+                ei, si = parse_err(err)
                 if status != "ok":
-                    add_csv(csv_file, ["filename", "opt", "status", "err_info", "stack_info"],
-                            [masked_file, opt, status, err_info, stack_info])
-                logging.info('filename:%s opt:%s status:%s err_info:%s stack_info:%s',
-                             newfilename, opt, status, err_info, stack_info)
+                    add_csv(args.csv_file, ["filename", "opt", "status", "err_info", "stack_info"],
+                            [mpath, opt, status, ei, si])
+                logging.info("filename=%s opt=%s status=%s", mname, opt, status)
         else:
-            opt = "0"
-            status, err = compile_rust(os.path.dirname(masked_file), newfilename, opt)
-            err_info, stack_info = get_err(err)
+            status, err = compile_rust(d, mname, "0")
+            ei, si = parse_err(err)
             if status != "ok":
-                add_csv(csv_file, ["filename", "opt", "status", "err_info", "stack_info"],
-                        [masked_file, opt, status, err_info, stack_info])
-            logging.info('filename:%s opt:%s status:%s err_info:%s stack_info:%s',
-                         newfilename, opt, status, err_info, stack_info)
+                add_csv(args.csv_file, ["filename", "opt", "status", "err_info", "stack_info"],
+                        [mpath, "0", status, ei, si])
+            logging.info("filename=%s opt=0 status=%s", mname, status)
 
 
 if __name__ == "__main__":
-    # [PATCH] 일부 환경에서 set_start_method 중복 호출 충돌 방지: 여기선 사용 안 함.
     main()
