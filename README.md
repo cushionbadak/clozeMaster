@@ -5,10 +5,17 @@ Artifacts for "ClozeMaster: Fuzzing Rust Compiler by Harnessing LLMs for Infilli
 This is forked repository of the original `https://github.com/clozeMasterPro/clozeMaster`,
 and this branch, `faster` contains two major updates for faster code generation:
 
-1. early stopping (when it meets EOM token, then stops to inference)
-2. batch execution
+1. Early stop on EOM: decoding stops as soon as the model produces <|endofmask|>, avoiding unnecessary tokens.
+2. Parallel file processing: optional multi-process execution at the file level. Each worker handles files independently.
 
-the default is `--batch_size 4`, and you can customize batch size or use `--no_batch`
+- The infilling protocol, sentinels (<|mask:i|>), and post-processing are unchanged.
+- Special tokens are pinned (BOS=<|endoftext|>, EOM=<|endofmask|>, pad=<pad>).
+- Sampling settings remain conservative (top_p=0.95, temperature configurable).
+
+### use this branch in docker
+1. run docker container with origina clozemaster docker image
+2. overwrite `main.py` and `model/IncoderModel.py` file
+3. Run `python3 main.py --workers N` for N parallelism.
 
 ## Introduction
 ClozeMaster is a novel fuzzing tool that leverages large language models (LLMs) to generate effective test cases for Rust compilers. The key idea behind ClozeMaster is to identify the bracket structure of given code and use it to guide the generation of new test cases through masked token completion. 
