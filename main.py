@@ -44,7 +44,7 @@ def add_csv(filename, columns, new_line):
 def ensure_parent(path):
     parent = os.path.dirname(path)
     if parent and not os.path.exists(parent):
-        os.makedirs(parent)
+        os.makedirs(parent, exist_ok=True)
 
 def compile_rust(dirpath, rsfile, opt):
     cmd = f"rustc {rsfile} -C opt-level={opt} --out-dir temp"
