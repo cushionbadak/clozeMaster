@@ -56,6 +56,7 @@ def load_model(model_path, tokenizer_path, device):
     kwargs = {}
     logging.info(f"loading model from {model_path} ...")
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs).half().to(device)
+    model.eval()  # <-- 추론 전용 모드로 고정 (드롭아웃/Autograd 오버헤드 제거)
 
     logging.info(f"loading tokenizer from {tokenizer_path} ...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -66,7 +67,6 @@ def load_model(model_path, tokenizer_path, device):
     )
     tokenizer.padding_side = "left"
 
-    # --- 체크: bos_token 값 확인 ---
     if tokenizer.bos_token != "<|endoftext|>":
         raise ValueError(
             f"Unexpected bos_token: {tokenizer.bos_token!r}. "
@@ -74,10 +74,8 @@ def load_model(model_path, tokenizer_path, device):
         )
     logging.info(f"bos_token check passed: {tokenizer.bos_token!r}")
 
-    # 토큰 사전 크기 동기화
     model.resize_token_embeddings(len(tokenizer))
 
-    # 모델 config 동기화
     ids = dict(
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
@@ -86,7 +84,6 @@ def load_model(model_path, tokenizer_path, device):
     for k, v in ids.items():
         setattr(model.config, k, v)
 
-    # generation_config 재생성
     try:
         model.generation_config = GenerationConfig.from_model_config(model.config)
     except Exception:
@@ -97,6 +94,7 @@ def load_model(model_path, tokenizer_path, device):
         )
 
     return model, tokenizer
+
 
 
 class InCoder:
@@ -305,22 +303,20 @@ class InCoder:
 
         return StoppingCriteriaList([_StopOnSubsequence([eom_ids], device=self.device)])
 
-    
     def generate_batch(self, prompts, max_to_generate=128, temperature=0.2, generators=None):
         """
         여러 프롬프트를 한 번에 생성한다. 반환은 각 샘플의 '전체 디코드 문자열'(BOS 제거)이다.
-        - generate()와 정책 동일: top_p=0.95, temperature, max_length=입력길이+max_to_generate
-        - 조기 종료(안전): EOM 단일 토큰이면 eos_token_id 활용
-        - 재현성: Hugging Face가 리스트 형태의 per-sample generator를 지원하는 버전이면 `generators`에 전달.
+        - top_p=0.95, temperature, max_length=입력길이+max_to_generate (기존 정책 유지)
+        - EOM 단일 토큰이면 eos_token_id로 조기 종료
+        - pad_to_multiple_of=8 + attention_mask 명시 (커널 효율)
         """
         assert isinstance(prompts, list)
         if len(prompts) == 0:
             return []
 
-        # EOM 단일 토큰 여부 확인
         eom_id = self._eom_token_id()
         if eom_id is None:
-            # 배치 조기종료는 다중 토큰에서 안전하지 않다. 정확성을 우선하여 단일 샘플 경로로 폴백.
+            # 정확성 우선: EOM 다중 토큰이면 배치 안전 조기종료 불가 → 단일 샘플 경로로 폴백
             logging.warning("EOM is multi-token for this tokenizer; falling back to per-sample generation for correctness.")
             return [self.generate(p, max_to_generate=max_to_generate, temperature=temperature) for p in prompts]
 
@@ -328,40 +324,40 @@ class InCoder:
             prompts,
             return_tensors="pt",
             padding=True,
+            pad_to_multiple_of=8,           # <-- 텐서코어/메모리 정렬에 유리
+            return_attention_mask=True,     # <-- 명시적 마스크
             return_token_type_ids=False,
-            add_special_tokens=False,     # ← eos/pad 의존 제거
+            add_special_tokens=False,
         )
-        # 혹시 토크나이저 구현에 따라 들어오면 방어적으로 제거
         inputs = {k: v.to(self.device) for k, v in enc.items() if k != "token_type_ids"}
         max_length = inputs["input_ids"].shape[1] + max_to_generate
         if max_length > 2048:
             logging.warning("warning: max_length %d exceeds context window 2048", max_length)
 
         gen_arg = generators if generators is not None else None
-        # 호환성: 일부 버전은 per-sample generator 리스트를 지원하지 않음
         if isinstance(gen_arg, list):
+            # 일부 HF 버전은 리스트 미지원 → 첫 번째만 사용
             gen_arg = gen_arg if hasattr(torch.Generator, "__iter__") else gen_arg[0]
 
-        with torch.no_grad():
+        with torch.inference_mode():  # <-- no_grad보다 더 얕은 오버헤드
             outputs = self.model.generate(
-                **inputs,  # input_ids + attention_mask (token_type_ids 없음)
+                **inputs,
                 do_sample=True,
                 top_p=0.95,
                 temperature=temperature,
                 max_length=max_length,
-                eos_token_id=eom_id,                  # ← 배치-안전한 조기 종료
+                eos_token_id=eom_id,
                 pad_token_id=self.tokenizer.pad_token_id,
                 generator=gen_arg,
             )
-        # torch.cuda.empty_cache()
 
         decoded = []
         pad_id = self.tokenizer.pad_token_id
 
-        # 중요: 왼쪽 패딩 길이를 행(row)별로 계산하여 잘라낸 뒤 디코딩
         for row, out in enumerate(outputs):
+            # 왼쪽 PAD 제거 후 디코드 (padding_side='left' 유지)
             pad_len = int((inputs["input_ids"][row] == pad_id).sum().item()) if pad_id is not None else 0
-            trimmed_ids = out[pad_len:]  # 왼쪽 PAD 제거
+            trimmed_ids = out[pad_len:]
 
             detok = self.tokenizer.decode(trimmed_ids, clean_up_tokenization_spaces=False)
             if detok.startswith(self.BOS):
@@ -369,18 +365,37 @@ class InCoder:
             decoded.append(detok)
 
         return decoded
-
-
-
-    def infill_batch(self, maskedCodes, max_to_generate=128, temperature=0.2, rng_seeds=None):
+    
+    @staticmethod
+    def _bucket_by_length(indices, lengths, max_bs=20, max_span=128):
         """
-        infill()과 동일한 동작을 '배치'로 수행한다.
-        - extra_sentinel=True 동작 재현: 마지막 part 뒤에도 <|mask:N|> 부착
-        - 마스크별(0..N-1) 순서로 스텝을 진행하며, 각 스텝은 배치(generate_batch)로 병렬 생성
-        - 각 스텝에서 현재 마스크 토큰(<|mask:i|>)을 한 번 더 붙인 프롬프트로 생성(기존 infill과 동일)
-        - EOM 기준으로 자른 뒤(EOM 제거) parts 사이에 infill만 끼워 최종 text 구성
-        - rng_seeds: 재현성이 필요하면 샘플 수와 동일한 길이의 정수 리스트를 넘겨 per-sample 시드를 고정
-        (주의: HF 버전에 따라 per-sample generator 리스트가 지원되지 않을 수 있음)
+        길이 기반 버킷팅:
+        - 같은 버킷 안에서는 (최대길이 - 최소길이) <= max_span 이 되도록 묶음
+        - 한 버킷의 최대 배치 크기는 max_bs
+        """
+        pairs = sorted(((i, lengths[i]) for i in indices), key=lambda x: x[1])
+        batches, cur, base = [], [], None
+        for i, L in pairs:
+            if not cur:
+                cur, base = [i], L
+            elif (len(cur) < max_bs) and (L - base <= max_span):
+                cur.append(i)
+            else:
+                batches.append(cur); cur, base = [i], L
+        if cur:
+            batches.append(cur)
+        return batches
+
+    def infill_batch(self, maskedCodes, max_to_generate=128, temperature=0.2, rng_seeds=None,
+                    bucket_max_bs=20, bucket_max_span=128):
+        """
+        infill()과 동일한 동작을 '배치'로 수행(동일 출력 보장).
+        개선점:
+        - 스텝별(step_prompts)로 길이 버킷팅하여 패딩 낭비 최소화
+        - generate_batch는 pad_to_multiple_of=8, inference_mode 사용
+        파라미터:
+        - bucket_max_bs: 버킷 내 최대 배치 크기(기본 20)
+        - bucket_max_span: 같은 버킷 내 허용 길이 차(토큰 수, 기본 128)
         """
         assert isinstance(maskedCodes, list)
         all_parts = [mc.split("<insert>") for mc in maskedCodes]
@@ -388,7 +403,7 @@ class InCoder:
         if not all_parts:
             return []
 
-        # base prompt: extra_sentinel=True에 맞춰 각 part 뒤에 마스크 부착 (마지막 part 포함)
+        # base prompt: extra_sentinel=True (마지막 part 뒤에도 마스크 부착)
         base_prompts = []
         for parts in all_parts:
             if len(parts) == 1:
@@ -415,28 +430,41 @@ class InCoder:
             if not active:
                 continue
 
-            # 현재 마스크를 한 번 더 붙인 스텝 프롬프트(= infill과 동일)
+            # 현재 마스크를 한 번 더 붙인 스텝 프롬프트(원본 infill과 동일)
             step_prompts = [dyn_prompts[i] + f"<|mask:{gap_idx}|>" for i in active]
-
-            # per-step generator 매핑(선택)
             step_generators = None
             if generators is not None:
                 step_generators = [generators[i] for i in active]
 
-            # 배치 생성
-            detoks = self.generate_batch(
-                step_prompts,
-                max_to_generate=max_to_generate,
-                temperature=temperature,
-                generators=step_generators,
-            )
+            # ===== 길이 버킷팅 시작 =====
+            # 길이(토큰 수) 계산 (special tokens 미포함)
+            step_lengths = [len(self.tokenizer(p, add_special_tokens=False).input_ids) for p in step_prompts]
+            idxs = list(range(len(step_prompts)))
+            buckets = self._bucket_by_length(idxs, step_lengths, max_bs=bucket_max_bs, max_span=bucket_max_span)
 
-            # 각 샘플 후처리(EOM 자르기, infill만 추출, 누적)
-            for row, detok in enumerate(detoks):
+            # 버킷별로 generate_batch 호출 → 원래 순서로 재배치
+            detoks_all = [None] * len(step_prompts)
+            for bucket in buckets:
+                sub_prompts = [step_prompts[j] for j in bucket]
+                sub_gens = [step_generators[j] for j in bucket] if step_generators is not None else None
+                sub_out = self.generate_batch(
+                    sub_prompts,
+                    max_to_generate=max_to_generate,
+                    temperature=temperature,
+                    generators=sub_gens,
+                )
+                for j, out in zip(bucket, sub_out):
+                    detoks_all[j] = out
+            # ===== 길이 버킷팅 끝 =====
+
+            # 각 샘플 후처리(EOM 자르기, infill만 추출, 다음 스텝 컨텍스트 누적)
+            for row, detok in enumerate(detoks_all):
                 i = active[row]
                 prefix = step_prompts[row]
-                if len(detok) < len(prefix):
-                    completion = ""  # 안전장치
+                if detok is None:
+                    completion = ""
+                elif len(detok) < len(prefix):
+                    completion = ""
                 else:
                     completion = detok[len(prefix):]
 
@@ -446,7 +474,7 @@ class InCoder:
                 infilled = completion[:-len(self.EOM)]
 
                 collected_infills[i].append(infilled)
-                dyn_prompts[i] += completion  # 다음 스텝 컨텍스트로 누적
+                dyn_prompts[i] += completion
 
         # 최종 조립
         results = []
