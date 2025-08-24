@@ -9,16 +9,25 @@ import subprocess
 import time
 import csv
 
+# [PATCH] 프로세스당 CPU 스레드 폭주 방지 (가능한 한 일찍 설정)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 
+# [PATCH] 종료/정리 유틸
+import atexit
+import gc
+import signal
+
 from model.IncoderModel import InCoder
 from utils.masking import ClozeMask
-
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def get_rs_files(directory, suffix=['rs']):
@@ -75,7 +84,6 @@ def get_err(err):
 
 
 def add_csv(filename, columns, new_line_list):
-    # 파일이 없으면 헤더를 먼저 쓰고, 있으면 행만 append
     need_header = not os.path.exists(filename) or os.path.getsize(filename) == 0
     with open(filename, 'a', newline='') as file:
         writer = csv.writer(file)
@@ -97,11 +105,49 @@ _PROC_INCODER = None
 _PROC_CLOZE_MASK = None
 _PROC_READY = False
 
+# [PATCH] 워커 종료 시 VRAM/리소스 정리
+def _proc_finalize():
+    global _PROC_INCODER, _PROC_CLOZE_MASK
+    try:
+        if _PROC_INCODER is not None and hasattr(_PROC_INCODER, "model"):
+            try:
+                _PROC_INCODER.model.to("cpu")
+            except Exception:
+                pass
+        _PROC_INCODER = None
+        _PROC_CLOZE_MASK = None
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        gc.collect()
+    except Exception:
+        pass
+
+# [PATCH] SIGTERM/SIGINT 수신 시 정리 후 즉시 종료
+def _sigterm_then_exit(signum, frame):
+    _proc_finalize()
+    os._exit(0)
+
 
 def _proc_initializer(model_path, tokenizer_path, device_str):
     """
     각 워커 프로세스에서 1회 실행되어 모델/토크나이저/마스커를 로드.
     """
+    # [PATCH] 종료 훅/시그널 → 먼저 등록
+    atexit.register(_proc_finalize)
+    try:
+        signal.signal(signal.SIGTERM, _sigterm_then_exit)
+        signal.signal(signal.SIGINT, _sigterm_then_exit)
+    except Exception:
+        pass
+
+    # [PATCH] 프로세스당 CPU 스레드 수 제한 (프리즈 방지)
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
     global _PROC_INCODER, _PROC_CLOZE_MASK, _PROC_READY
     device = torch.device(device_str)
     _PROC_INCODER = InCoder(model_path, tokenizer_path, device)
@@ -129,14 +175,13 @@ def _process_one_file(rs_file, temperature):
     if len(code) > 500:
         return newfiles_local
 
-    masked_codes = cloze_mask.mask_singel_code(code)  # 기존 util 함수명 그대로 사용
+    masked_codes = cloze_mask.mask_singel_code(code)
 
     filename = os.path.basename(rs_file)
     stem, ext = os.path.splitext(filename)
     out_dir = os.path.dirname(rs_file).replace('dataset', 'target_dataset')
     os.makedirs(out_dir, exist_ok=True)
 
-    # 배치 제거: 마스킹된 각 코드에 대해 순차적으로 code_infilling 호출
     for idx, masked in enumerate(masked_codes, start=1):
         new_code = incoder.code_infilling(masked, temperature=temperature)
         newfilename = f"{stem}_{idx}{ext}"
@@ -159,8 +204,6 @@ def main():
     parser.add_argument('--multi_opt', action='store_true', help='여러 opt-level로 컴파일')
 
     parser.add_argument('--temperature', type=float, default=0.2)
-
-    # 파일 단위 병렬 프로세스 수. 1이면 병렬 비활성.
     parser.add_argument('--workers', type=int, default=1)
 
     args = parser.parse_args()
@@ -173,9 +216,14 @@ def main():
                         filemode="w",
                         format="%(asctime)s - %(name)s - %(levelname)-9s - %(filename)-8s : %(lineno)s line - %(message)s",
                         datefmt="%Y-%m-%d %H:%M:%S")
+    # [PATCH] 콘솔 로그도 추가(걸리면 바로 보이게)
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter("%(levelname)-8s - %(message)s"))
+    logging.getLogger("").addHandler(console)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device_str = str(device)
+    device_str = "cuda:0" if device.type == "cuda" and torch.cuda.device_count() > 0 else "cpu"
 
     rs_files = get_rs_files(args.rs_files)
     random.shuffle(rs_files)
@@ -183,37 +231,37 @@ def main():
     logging.info('============================\n rs_files num:{}\n=========================\n'.format(len(rs_files)))
     logging.info("settings: temperature=%.3f, workers=%d", args.temperature, args.workers)
 
-    # -------------------------
-    # 파일 처리 (프로세스 병렬)
-    # -------------------------
     newfiles = []
 
     if args.workers <= 1:
-        # 단일 프로세스 경로
         _proc_initializer(args.model_path, args.tokenizer_path, device_str)
         for rs_file in tqdm(rs_files):
             res = _process_one_file(rs_file, temperature=args.temperature)
             newfiles.extend(res)
+        _proc_finalize()
     else:
-        mp.set_start_method('spawn', force=True)
+        # [PATCH] spawn 컨텍스트 고정
+        ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(
             max_workers=args.workers,
+            mp_context=ctx,
             initializer=_proc_initializer,
             initargs=(args.model_path, args.tokenizer_path, device_str)
         ) as ex:
             futures = [ex.submit(_process_one_file, rs_file, args.temperature) for rs_file in rs_files]
             for fut in tqdm(as_completed(futures), total=len(futures)):
-                try:
-                    res = fut.result()
-                    newfiles.extend(res)
-                except Exception as e:
-                    logging.exception("Worker failed: %s", e)
+                exc = fut.exception()
+                if exc:
+                    logging.exception("Worker failed with %s: %s", type(exc).__name__, exc)
+                    print(f"Worker failed with {type(exc).__name__}: {exc}")
+                    continue
+                res = fut.result()
+                newfiles.extend(res)
+            # [PATCH] 명시적 종료
+            ex.shutdown(wait=True, cancel_futures=True)
 
     logging.info('============================\n newfiles num:{}\n=========================\n'.format(len(newfiles)))
 
-    # -------------------------
-    # 컴파일 단계 (단일 스레드; 필요시 별도 병렬도 가능)
-    # -------------------------
     opts = ['0', '1', '2', '3', 's', 'z']
     csv_file = args.csv_file
 
@@ -239,4 +287,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # [PATCH] 일부 환경에서 set_start_method 중복 호출 충돌 방지: 여기선 사용 안 함.
     main()
