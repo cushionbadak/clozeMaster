@@ -4,3 +4,5 @@ target_dataset
 log
 *.log
 temp
+
+._*
