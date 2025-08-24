@@ -94,6 +94,13 @@ if __name__=="__main__":
     parser.add_argument('--csv_file', type=str, default = './log/bug.csv')#your csv file path
     parser.add_argument('--log_file', type=str, default = './log/demo.log')#your log file path
     parser.add_argument('--multi_opt',type=bool,default=False)# whether test with different opts
+    parser.add_argument('--batch_size', type=int, default=4,
+                        help="최대 batch size (기본: 4). masked_codes가 많으면 잘라서 여러 배치로 처리.")
+    parser.add_argument(
+        '--no-batch', action='store_true',
+        help="배치 사용 없이 단일 호출(code_infilling) 경로로 실행."
+    )
+
     args = parser.parse_args()
     ensure_file_path_exists(args.log_file)
     ensure_file_path_exists(args.csv_file)
@@ -124,22 +131,39 @@ if __name__=="__main__":
     for rs_file in tqdm(rs_files):
         with open(rs_file,'r',errors='ignore') as f:
             code = f.read()
-        if len(code)>500:
+        if len(code) > 500:
             continue
         masked_codes = cloze_mask.mask_singel_code(code)
-        cnt=0
-        for masked_code in masked_codes:
-            cnt+=1
-            masked_file=rs_file.replace('dataset','target_dataset')
-            filename=rs_file.split('/')[-1]
-            newfilename=filename.split('.')[0]+'_'+str(cnt)+'.'+filename.split('.')[1]
-            masked_file=masked_file.replace(filename,newfilename)
-            if not os.path.exists(os.path.dirname(masked_file)):
-                os.makedirs(os.path.dirname(masked_file))
-            new_code=incoder.code_infilling(masked_code,temperature=0.2)
-            with open(masked_file,'w') as f:
-                f.write(new_code)
+
+        # 파일명 분해
+        filename = os.path.basename(rs_file)
+        stem, ext = os.path.splitext(filename)  # ext는 ".rs"처럼 점을 포함
+
+        # --- 변경: --no-batch 시 단일 호출(code_infilling), 기본은 배치 ---
+        out_dir = os.path.dirname(rs_file).replace('dataset', 'target_dataset')
+        os.makedirs(out_dir, exist_ok=True)
+        if args.no_batch:
+            logging.info("no-batch 모드: code_infilling 경로 사용")
+            for idx, masked in enumerate(masked_codes, start=1):
+                new_code = incoder.code_infilling(masked, temperature=0.2)
+                newfilename = f"{stem}_{idx}{ext}"
+                masked_file = os.path.join(out_dir, newfilename)
+                with open(masked_file, 'w') as f:
+                    f.write(new_code)
                 newfiles.append((masked_file, newfilename))
+        else:
+            for start in range(0, len(masked_codes), args.batch_size):
+                batch = masked_codes[start:start+args.batch_size]
+                new_codes = incoder.code_infilling_batch(batch, temperature=0.2)
+                for local_idx, new_code in enumerate(new_codes, start=1):
+                    # 배치 간에도 번호가 이어지도록 전역 인덱스 계산
+                    global_idx = start + local_idx
+                    newfilename = f"{stem}_{global_idx}{ext}"
+                    masked_file = os.path.join(out_dir, newfilename)
+                    with open(masked_file, 'w') as f:
+                        f.write(new_code)
+                    newfiles.append((masked_file, newfilename))
+
 
     logging.info('============================\n newfiles num:{}\n=========================\n'.format(len(newfiles)))
 
