@@ -73,7 +73,7 @@ def get_err(err):
     return err_info,stack_info
 
 def add_csv(filename,columns,new_line_list):
-    with open(filename, 'a', newline='') as file:
+    with open(filename, 'a', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
 
         if file.tell() == 0:
@@ -149,7 +149,7 @@ if __name__=="__main__":
                 logging.warning('CUDA OOM on {}, skipping'.format(masked_file))
                 torch.cuda.empty_cache()
                 continue
-            with open(masked_file,'w') as f:
+            with open(masked_file,'w', encoding='utf-8') as f:
                 f.write(new_code)
 
             if args.multi_opt:
