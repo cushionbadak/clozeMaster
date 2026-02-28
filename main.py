@@ -40,9 +40,10 @@ def compare_text(text1, text2):
 def compile_rust(filepath,rsfile,opt):
     cmd=["rustc", rsfile, "-C", "opt-level={}".format(opt), "--out-dir", "temp"]
     time_limit=60 # stable is 180; while 60 make the reproduction faster
-    p=subprocess.Popen(cmd,cwd=filepath, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    p=subprocess.Popen(cmd,cwd=filepath, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     try:
         out, err = p.communicate(timeout=time_limit)
+        err = err.decode("utf-8", errors="replace")
         returncode = p.returncode
         if "internal compiler error" in err.lower() or "compiler unexpectedly panicked" in err.lower():
             return "ice",err
