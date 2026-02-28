@@ -38,6 +38,10 @@ else
 fi
 
 echo "[4/6] Creating conda environment (py38)..."
+# Accept Conda ToS for default channels (required since late 2025)
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
+
 if ! conda env list | grep -q "^py38 "; then
     conda create -n py38 python=3.8 -y
 fi
