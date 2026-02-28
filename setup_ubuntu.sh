@@ -26,15 +26,19 @@ echo "Using: $(rustc --version)"
 
 # 3. Miniconda + Python 3.8
 echo "[3/6] Installing Miniconda..."
-if ! command -v conda &> /dev/null; then
+if [ -d "$HOME/miniconda3" ]; then
+    # Directory exists from a previous (possibly partial) install — just activate
+    eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
+    echo "Conda already installed"
+elif command -v conda &> /dev/null; then
+    eval "$(conda shell.bash hook)"
+    echo "Conda already installed"
+else
     wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
     bash /tmp/miniconda.sh -b -p "$HOME/miniconda3"
     eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
     conda init bash
     rm /tmp/miniconda.sh
-else
-    eval "$(conda shell.bash hook)"
-    echo "Conda already installed"
 fi
 
 echo "[4/6] Creating conda environment (py38)..."
