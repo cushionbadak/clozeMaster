@@ -25,7 +25,7 @@ total_files=0
 total_bugs=0
 run_count=0
 
-fmt="%-34s  %-39s  %-14s  %6s  %4s\n"
+fmt="%-34s  %-39s  %-14s  %8s  %6s\n"
 
 printf "$fmt" "Log" "Period" "Elapsed" "Files" "Bugs"
 printf "$fmt" "---" "------" "-------" "-----" "----"
