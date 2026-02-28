@@ -1,5 +1,40 @@
 # ClozeMaster-demo
 Artifacts for "ClozeMaster: Fuzzing Rust Compiler by Harnessing LLMs for Infilling Masked Real Programs".
+
+## fix/oom-kill branch
+
+This branch fixes the OOM (Out-Of-Memory) kill issue that caused the fuzzing process to crash after running for many hours:
+
+- **Zombie rustc processes**: Previously, timed-out `rustc` compilations were not properly killed (`shell=True` only terminated the intermediate shell, leaving `rustc` alive). Over time, hundreds of zombie processes accumulated and exhausted system memory, causing the OS to kill the python process. Now uses direct process execution with process group kill (`SIGKILL`) to ensure full cleanup.
+- **CUDA OOM**: Previously, a single GPU out-of-memory error during LLM inference would crash the entire run. Now catches `torch.cuda.OutOfMemoryError`, clears the GPU cache, and skips to the next input.
+
+### Quick Setup (Ubuntu)
+
+We provide a setup script that installs all dependencies on a fresh Ubuntu machine:
+```sh
+git clone -b fix/oom-kill https://github.com/cushionbadak/clozeMaster.git
+cd clozeMaster
+bash setup_ubuntu.sh
+```
+To specify a Rust nightly toolchain version:
+```sh
+RUST_TOOLCHAIN=nightly-2025-09-02 bash setup_ubuntu.sh
+```
+
+The script handles:
+- System packages (git, curl, build-essential)
+- Rust compiler via rustup (configurable nightly toolchain)
+- Miniconda + Python 3.8 environment (`py38`)
+- PyTorch (CUDA 11.8), tokenizers, pandas, and other Python dependencies
+- [Incoder-1B](https://huggingface.co/facebook/incoder-1B) model weights download
+
+After setup, place your `.rs` test files in `dataset/history_codes/` (nested directories are supported) and run:
+```sh
+conda activate py38
+python main.py
+```
+
+---
 ## Introduction
 ClozeMaster is a novel fuzzing tool that leverages large language models (LLMs) to generate effective test cases for Rust compilers. The key idea behind ClozeMaster is to identify the bracket structure of given code and use it to guide the generation of new test cases through masked token completion. 
 <br>

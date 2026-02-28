@@ -1,3 +1,6 @@
+torch
+tokenizers
+pandas
 tqdm==4.65.0
 transformers==4.28.1
 datasets==2.11.0
