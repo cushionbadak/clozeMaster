@@ -74,8 +74,8 @@ mkdir -p temp log dataset/history_codes target_dataset
 
 echo ""
 echo "=== Setup complete ==="
-echo "Activate env:  conda activate py38"
-echo "Run:           python main.py"
+echo "First, reload your shell:  source ~/.bashrc"
+echo "Then:  conda activate py38 && python main.py"
 echo ""
 echo "NOTE: Place your .rs files in dataset/history_codes/ (nested dirs OK)."
 echo "To use a different Rust toolchain: RUST_TOOLCHAIN=nightly-2025-01-01 bash setup_ubuntu.sh"
