@@ -21,10 +21,11 @@ bash run_resume.sh                                   # resume with defaults
 bash run_resume.sh --rs_files ./dataset/history_codes # pass extra args
 ```
 
-`run_resume.sh` does three things before calling `main.py --resume`:
+`run_resume.sh` does four things before calling `main.py --resume`:
 1. Moves `log/demo.log` to `log/demo_<timestamp>.log` (since main.py overwrites the log)
 2. Copies `log/bug.csv` to `log/bug_<timestamp>.csv` (snapshot backup; the original keeps accumulating)
-3. Invokes `python main.py --resume`, which skips source files whose first variant (`<name>_1.rs`) already exists in `target_dataset/`
+3. Removes leftover `temp/` dirs in `target_dataset/` from a previous crashed run
+4. Invokes `python main.py --resume`, which skips source files whose first variant (`<name>_1.rs`) already exists in `target_dataset/`
 
 You can also use the flag directly, but note that `main.py` always overwrites `demo.log` on startup (`filemode="w"`), so **use `run_resume.sh` to preserve previous logs**:
 ```sh

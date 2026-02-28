@@ -13,4 +13,7 @@ if [ -f log/bug.csv ]; then
     cp log/bug.csv "log/bug_${timestamp}.csv"
 fi
 
+# Clean up leftover temp/ dirs from a crashed run
+find target_dataset -type d -name temp -exec rm -rf {} + 2>/dev/null || true
+
 exec python main.py --resume "$@"
