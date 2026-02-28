@@ -9,6 +9,30 @@ This branch fixes the OOM (Out-Of-Memory) kill issue that caused the fuzzing pro
 - **CUDA OOM**: Previously, a single GPU out-of-memory error during LLM inference would crash the entire run. Now catches `torch.cuda.OutOfMemoryError`, clears the GPU cache, and skips to the next input.
 - **temp/ cleanup**: Compiled binaries in `temp/` were never cleaned up, accumulating over time. Now automatically removed after each source file is fully processed.
 - **Result archiving**: `archive_results.sh` packages `log/` and `target_dataset/` into a timestamped `.tar.gz` (extracts into a single folder).
+- **Resumable runs**: `run_resume.sh` archives previous logs and invokes `main.py --resume` so only unprocessed files are sent through LLM inference.
+
+### Resuming an interrupted run
+
+If the process was interrupted (OOM kill, Ctrl-C, etc.), use the resume script to continue from where it left off:
+
+```sh
+bash run_resume.sh                                   # resume with defaults
+bash run_resume.sh --rs_files ./dataset/history_codes # pass extra args
+```
+
+`run_resume.sh` does three things before calling `main.py --resume`:
+1. Moves `log/demo.log` to `log/demo_<timestamp>.log` (since main.py overwrites the log)
+2. Copies `log/bug.csv` to `log/bug_<timestamp>.csv` (snapshot backup; the original keeps accumulating)
+3. Invokes `python main.py --resume`, which skips source files whose first variant (`<name>_1.rs`) already exists in `target_dataset/`
+
+You can also use the flag directly, but note that `main.py` always overwrites `demo.log` on startup (`filemode="w"`), so **use `run_resume.sh` to preserve previous logs**:
+```sh
+# Recommended: archives logs before running
+bash run_resume.sh
+
+# Without log archiving (demo.log will be overwritten, bug.csv is safe):
+python main.py --resume
+```
 
 ### Quick Setup (Ubuntu)
 

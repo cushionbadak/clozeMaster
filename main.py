@@ -100,6 +100,7 @@ if __name__=="__main__":
     parser.add_argument('--csv_file', type=str, default = './log/bug.csv')#your csv file path
     parser.add_argument('--log_file', type=str, default = './log/demo.log')#your log file path
     parser.add_argument('--multi_opt',type=bool,default=False)# whether test with different opts
+    parser.add_argument('--resume', action='store_true', default=False)
     args = parser.parse_args()
     ensure_file_path_exists(args.log_file)
     ensure_file_path_exists(args.csv_file)
@@ -123,8 +124,21 @@ if __name__=="__main__":
 
     rs_files=get_rs_files(args.rs_files)
     random.shuffle(rs_files)
-    
-    
+
+    if args.resume:
+        original_count = len(rs_files)
+        processed = set()
+        for rs_file in rs_files:
+            target_dir = os.path.dirname(rs_file.replace('dataset', 'target_dataset'))
+            filename = rs_file.split('/')[-1]
+            basename = filename.split('.')[0]
+            ext = filename.split('.')[1]
+            if os.path.exists(os.path.join(target_dir, f"{basename}_1.{ext}")):
+                processed.add(rs_file)
+        rs_files = [f for f in rs_files if f not in processed]
+        logging.info('Resume: {}/{} files already processed, {} remaining'.format(
+            len(processed), original_count, len(rs_files)))
+
     logging.info('============================\n rs_files num:{}\n=========================\n'.format(len(rs_files)))
     bug_count=0
     for rs_file in tqdm(rs_files):
