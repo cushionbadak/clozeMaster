@@ -7,6 +7,8 @@ This branch fixes the OOM (Out-Of-Memory) kill issue that caused the fuzzing pro
 
 - **Zombie rustc processes**: Previously, timed-out `rustc` compilations were not properly killed (`shell=True` only terminated the intermediate shell, leaving `rustc` alive). Over time, hundreds of zombie processes accumulated and exhausted system memory, causing the OS to kill the python process. Now uses direct process execution with process group kill (`SIGKILL`) to ensure full cleanup.
 - **CUDA OOM**: Previously, a single GPU out-of-memory error during LLM inference would crash the entire run. Now catches `torch.cuda.OutOfMemoryError`, clears the GPU cache, and skips to the next input.
+- **temp/ cleanup**: Compiled binaries in `temp/` were never cleaned up, accumulating over time. Now automatically removed after each source file is fully processed.
+- **Result archiving**: `archive_results.sh` packages `log/` and `target_dataset/` into a timestamped `.tar.gz` (extracts into a single folder).
 
 ### Quick Setup (Ubuntu)
 

@@ -3,6 +3,7 @@ import re
 import random
 import logging
 import signal
+import shutil
 
 import argparse
 from tqdm import tqdm
@@ -130,6 +131,7 @@ if __name__=="__main__":
             continue
         masked_codes = cloze_mask.mask_singel_code(code)
         cnt=0
+        temp_dirs=set()
         for masked_code in masked_codes:
             cnt+=1
             masked_file=rs_file.replace('dataset','target_dataset')
@@ -162,5 +164,7 @@ if __name__=="__main__":
                 if status!="ok":
                     add_csv(csv_file,["filename","opt","status","err_info","stack_info"],[masked_file,opt,status,err_info,stack_info])
                 logging.info('filename:{} opt:{} status:{} err_info:{} stack_info:{}'.format(newfilename,opt,status,err_info,stack_info))
-
-                
+            temp_dirs.add(os.path.join(os.path.dirname(masked_file),"temp"))
+        for td in temp_dirs:
+            if os.path.exists(td):
+                shutil.rmtree(td)
