@@ -16,6 +16,8 @@ This branch fixes the OOM (Out-Of-Memory) kill issue that caused the fuzzing pro
 
 If the process was interrupted (OOM kill, Ctrl-C, etc.), use the resume script to continue from where it left off:
 
+> **Note**: Make sure the conda environment is activated (`conda activate py38`) before running the script.
+
 ```sh
 bash run_resume.sh                                   # resume with defaults
 bash run_resume.sh --rs_files ./dataset/history_codes # pass extra args
