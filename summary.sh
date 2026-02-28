@@ -21,14 +21,14 @@ fmt_duration() {
 }
 
 total_time=0
-total_files=0
+total_mutants=0
 total_bugs=0
 run_count=0
 
 fmt="%-34s  %-39s  %-14s  %8s  %6s\n"
 
-printf "$fmt" "Log" "Period" "Elapsed" "Files" "Bugs"
-printf "$fmt" "---" "------" "-------" "-----" "----"
+printf "$fmt" "Log" "Period" "Elapsed" "Mutants" "Bugs"
+printf "$fmt" "---" "------" "-------" "-------" "----"
 
 for log in "$logdir"/demo*.log; do
     [ -f "$log" ] || continue
@@ -36,7 +36,7 @@ for log in "$logdir"/demo*.log; do
     first=$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$log" | head -1 || true)
     last=$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$log" | tail -1 || true)
 
-    files=$(grep -c 'filename:' "$log" 2>/dev/null) || files=0
+    mutants=$(grep -c 'filename:' "$log" 2>/dev/null) || mutants=0
     bugs=$(grep -c 'status:ice\|status:crash\|status:mem err\|status:timeout' "$log" 2>/dev/null) || bugs=0
 
     if [ -z "$first" ] || [ -z "$last" ]; then
@@ -49,12 +49,12 @@ for log in "$logdir"/demo*.log; do
     diff=$((t2 - t1))
 
     total_time=$((total_time + diff))
-    total_files=$((total_files + files))
+    total_mutants=$((total_mutants + mutants))
     total_bugs=$((total_bugs + bugs))
     run_count=$((run_count + 1))
 
     period="${first%:*} ~ ${last%:*}"
-    printf "$fmt" "$(basename "$log")" "$period" "$(fmt_duration $diff)" "$files" "$bugs"
+    printf "$fmt" "$(basename "$log")" "$period" "$(fmt_duration $diff)" "$mutants" "$bugs"
 done
 
 if [ "$run_count" -eq 0 ]; then
@@ -62,5 +62,5 @@ if [ "$run_count" -eq 0 ]; then
     exit 1
 fi
 
-printf "$fmt" "---" "" "-------" "-----" "----"
-printf "$fmt" "Total ($run_count runs)" "" "$(fmt_duration $total_time)" "$total_files" "$total_bugs"
+printf "$fmt" "---" "" "-------" "-------" "----"
+printf "$fmt" "Total ($run_count runs)" "" "$(fmt_duration $total_time)" "$total_mutants" "$total_bugs"
