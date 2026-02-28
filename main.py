@@ -2,6 +2,7 @@ import os
 import re
 import random
 import logging
+import signal
 
 import argparse
 from tqdm import tqdm
@@ -36,9 +37,9 @@ def compare_text(text1, text2):
     return text1==text2
 
 def compile_rust(filepath,rsfile,opt):
-    cmd="rustc {} -C opt-level={}  --out-dir temp".format(rsfile,opt) #--out-dir temp
+    cmd=["rustc", rsfile, "-C", "opt-level={}".format(opt), "--out-dir", "temp"]
     time_limit=60 # stable is 180; while 60 make the reproduction faster
-    p=subprocess.Popen(cmd,cwd=filepath, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True,text=True)
+    p=subprocess.Popen(cmd,cwd=filepath, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         out, err = p.communicate(timeout=time_limit)
         returncode = p.returncode
@@ -51,7 +52,8 @@ def compile_rust(filepath,rsfile,opt):
         else:
             return "ok",err
     except subprocess.TimeoutExpired:
-        p.terminate()
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        p.wait()
         return "timeout","" 
     
 def get_err(err):
@@ -136,7 +138,12 @@ if __name__=="__main__":
             masked_file=masked_file.replace(filename,newfilename)
             if not os.path.exists(os.path.dirname(masked_file)):
                 os.makedirs(os.path.dirname(masked_file))
-            new_code=incoder.code_infilling(masked_code,temperature=0.2)
+            try:
+                new_code=incoder.code_infilling(masked_code,temperature=0.2)
+            except torch.cuda.OutOfMemoryError:
+                logging.warning('CUDA OOM on {}, skipping'.format(masked_file))
+                torch.cuda.empty_cache()
+                continue
             with open(masked_file,'w') as f:
                 f.write(new_code)
 
