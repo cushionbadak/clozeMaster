@@ -10,7 +10,7 @@ This branch fixes the OOM (Out-Of-Memory) kill issue that caused the fuzzing pro
 - **temp/ cleanup**: Compiled binaries in `temp/` were never cleaned up, accumulating over time. Now automatically removed after each source file is fully processed.
 - **Result archiving**: `archive_results.sh` packages `log/` and `target_dataset/` into a timestamped `.tar.gz` (extracts into a single folder).
 - **Resumable runs**: `run_resume.sh` archives previous logs and invokes `main.py --resume` so only unprocessed files are sent through LLM inference.
-- **Elapsed time**: `elapsed.sh` shows how long the current (or finished) run has been going by reading log timestamps.
+- **Run summary**: `summary.sh` shows elapsed time, files processed, and bugs found across all runs.
 
 ### Resuming an interrupted run
 
@@ -38,13 +38,22 @@ bash run_resume.sh
 python main.py --resume
 ```
 
-### Checking elapsed time
+### Run summary
 
-While `main.py` is running (or after it finishes), check how long it has been going:
+Check elapsed time, files processed, and bugs found across all runs:
 
 ```sh
-bash elapsed.sh                              # defaults to ./log/demo.log
-bash elapsed.sh ./log/demo_20260301_120000.log  # check an archived log
+bash summary.sh
+```
+
+Example output:
+```
+Log                               Period                 Elapsed         Files  Bugs
+---                               ------                 -------         -----  ----
+demo_20260301_120000.log          2026-03-01 12:00 ~ …   3h 23m 45s      482     3
+demo.log                          2026-03-01 16:00 ~ …   2h 10m 12s      310     1
+---                                                      -------         -----  ----
+Total (2 runs)                                           5h 33m 57s      792     4
 ```
 
 ### Quick Setup (Ubuntu)
