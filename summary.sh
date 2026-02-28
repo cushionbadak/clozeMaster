@@ -25,8 +25,10 @@ total_files=0
 total_bugs=0
 run_count=0
 
-printf "%-32s  %-21s  %-14s  %6s  %4s\n" "Log" "Period" "Elapsed" "Files" "Bugs"
-printf "%-32s  %-21s  %-14s  %6s  %4s\n" "---" "------" "-------" "-----" "----"
+fmt="%-34s  %-39s  %-14s  %6s  %4s\n"
+
+printf "$fmt" "Log" "Period" "Elapsed" "Files" "Bugs"
+printf "$fmt" "---" "------" "-------" "-----" "----"
 
 for log in "$logdir"/demo*.log; do
     [ -f "$log" ] || continue
@@ -38,7 +40,7 @@ for log in "$logdir"/demo*.log; do
     bugs=$(grep -c 'status:ice\|status:crash\|status:mem err\|status:timeout' "$log" 2>/dev/null || echo 0)
 
     if [ -z "$first" ] || [ -z "$last" ]; then
-        printf "%-32s  (no timestamps)\n" "$(basename "$log")"
+        printf "%-34s  (no timestamps)\n" "$(basename "$log")"
         continue
     fi
 
@@ -52,7 +54,7 @@ for log in "$logdir"/demo*.log; do
     run_count=$((run_count + 1))
 
     period="${first%:*} ~ ${last%:*}"
-    printf "%-32s  %-21s  %-14s  %6d  %4d\n" "$(basename "$log")" "$period" "$(fmt_duration $diff)" "$files" "$bugs"
+    printf "$fmt" "$(basename "$log")" "$period" "$(fmt_duration $diff)" "$files" "$bugs"
 done
 
 if [ "$run_count" -eq 0 ]; then
@@ -60,5 +62,5 @@ if [ "$run_count" -eq 0 ]; then
     exit 1
 fi
 
-printf "%-32s  %-21s  %-14s  %6s  %4s\n" "---" "" "-------" "-----" "----"
-printf "%-32s  %-21s  %-14s  %6d  %4d\n" "Total ($run_count runs)" "" "$(fmt_duration $total_time)" "$total_files" "$total_bugs"
+printf "$fmt" "---" "" "-------" "-----" "----"
+printf "$fmt" "Total ($run_count runs)" "" "$(fmt_duration $total_time)" "$total_files" "$total_bugs"
