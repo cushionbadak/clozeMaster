@@ -89,8 +89,10 @@ def ensure_file_path_exists(file_path):
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, default = "/clozeMaster/model/Incoder1b")#your model path
-    parser.add_argument('--tokenizer_path', type=str, default="/clozeMaster/model/Incoder1b")# #your tokenizer path
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _default_model = os.path.join(_script_dir, "model", "Incoder1b")
+    parser.add_argument('--model_path', type=str, default=_default_model)#your model path
+    parser.add_argument('--tokenizer_path', type=str, default=_default_model)# #your tokenizer path
     
     parser.add_argument('--rs_files', type=str, default = './dataset/history_codes')#your rust files path,default is the rust files path
 
