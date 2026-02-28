@@ -33,8 +33,8 @@ printf "$fmt" "---" "------" "-------" "-----" "----"
 for log in "$logdir"/demo*.log; do
     [ -f "$log" ] || continue
 
-    first=$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$log" | head -1)
-    last=$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$log" | tail -1)
+    first=$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$log" | head -1 || true)
+    last=$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$log" | tail -1 || true)
 
     files=$(grep -c 'filename:' "$log" 2>/dev/null) || files=0
     bugs=$(grep -c 'status:ice\|status:crash\|status:mem err\|status:timeout' "$log" 2>/dev/null) || bugs=0
